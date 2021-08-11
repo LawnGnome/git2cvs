@@ -1,5 +1,7 @@
+#[macro_use]
+extern crate lazy_static;
+
 use std::{
-    collections::{HashMap, HashSet},
     ffi::OsString,
     fs::{self, Permissions},
     os::unix::prelude::PermissionsExt,
@@ -9,13 +11,14 @@ use std::{
 use database::Database;
 use filetime::FileTime;
 use git::Repository;
-use git2::Oid;
+use git2::{Commit, ObjectType, TreeEntry, TreeWalkResult};
 use structopt::StructOpt;
 use tempfile::tempdir;
 
 mod cvs;
 mod database;
 mod git;
+mod state;
 
 #[derive(Debug, StructOpt)]
 struct Opt {
@@ -80,106 +83,64 @@ fn main() -> anyhow::Result<()> {
 
     // Ensure we have a target directory.
     // TODO: handle an already existing directory.
-    let mut target = PathBuf::new();
-    target.push(tempdir.path());
-    target.push(&opt.target);
+    let target: PathBuf = [tempdir.path().as_os_str(), &opt.target].iter().collect();
     log::trace!("target: {:?}", &target);
     fs::create_dir_all(&target)?;
+
+    let mut state = state::Global::new(tempdir.path(), &opt.target);
+
+    // We have to add the target directory to the CVS repository before we can
+    // do anything.
     cvs_repo.add(&opt.target, false)?;
 
-    let mut files: HashMap<OsString, Oid> = HashMap::new();
     for (i, oid) in commits.iter().enumerate() {
         let commit = repo.commit(oid)?;
-        let mut files_seen = HashSet::new();
+        let mut commit_state = state::Commit::new();
 
-        commit
-            .tree()?
-            .walk(git2::TreeWalkMode::PreOrder, |path, entry| {
-                // TODO: refactor into a real function we can Try on.
-
-                let mut git_path = PathBuf::from(path);
-                if let Some(name) = entry.name() {
-                    git_path.push(name);
+        commit.tree()?.walk(
+            git2::TreeWalkMode::PreOrder,
+            |path, entry| match walk_tree_entry(
+                path,
+                entry,
+                &commit,
+                &mut state,
+                &mut commit_state,
+                &repo,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    log::error!(
+                        "error walking entry with path {} and {:?}: {:?}",
+                        path,
+                        entry.name(),
+                        e
+                    );
+                    TreeWalkResult::Abort
                 }
-
-                let mut cvs_path = PathBuf::from(&opt.target);
-                cvs_path.push(&git_path);
-
-                let mut absolute = target.clone();
-                absolute.push(&git_path);
-
-                match entry.kind() {
-                    Some(git2::ObjectType::Blob) => {
-                        let oid = entry.id();
-                        let blob = repo.blob(&oid).unwrap();
-
-                        // Figure out if we need to write this.
-                        match files.get(cvs_path.as_os_str().into()) {
-                            Some(last_oid) if &oid == last_oid => {
-                                // No action required.
-                            }
-                            _ => {
-                                // We need to write the file.
-                                fs::write(&absolute, blob.content()).unwrap();
-
-                                // CVS uses the modification time, so let's set
-                                // that.
-                                let time = FileTime::from_unix_time(commit.time().seconds(), 0);
-                                filetime::set_file_times(&absolute, time, time).unwrap();
-
-                                // The file may be executable, so let's check.
-                                if (entry.filemode() & 0o111) != 0 {
-                                    let perm =
-                                        fs::metadata(&absolute).unwrap().permissions().mode()
-                                            | 0o111;
-
-                                    fs::set_permissions(&absolute, Permissions::from_mode(perm))
-                                        .unwrap();
-                                }
-
-                                cvs_repo
-                                    .add(cvs_path.as_os_str(), blob.is_binary())
-                                    .unwrap();
-
-                                files.insert(cvs_path.as_os_str().into(), oid);
-                            }
-                        };
-
-                        files_seen.insert(cvs_path.into_os_string());
-
-                        git2::TreeWalkResult::Ok
-                    }
-                    Some(git2::ObjectType::Tree) => {
-                        if fs::metadata(&absolute).is_err() {
-                            fs::create_dir_all(absolute).unwrap();
-                            cvs_repo.add(cvs_path.as_os_str(), false).unwrap();
-                        }
-
-                        git2::TreeWalkResult::Ok
-                    }
-                    _ => {
-                        log::trace!("unknown kind: {:?}", entry.kind());
-                        git2::TreeWalkResult::Skip
-                    }
-                }
-            })?;
+            },
+        )?;
 
         // Remove files that have been removed.
-        let mut files_removed = HashSet::new();
-        for file in files.keys() {
-            if !files_seen.contains(file) {
-                log::trace!("removing file {:?}", &file);
+        cvs_repo.remove_multiple(
+            state
+                .remove_files_unseen_in_commit(&commit_state)
+                .into_iter()
+                .map(|file| file.cvs_relative_path()),
+        )?;
 
-                let mut path = PathBuf::new();
-                path.push(tempdir.path());
-                path.push(file);
-                fs::remove_file(path)?;
-
-                cvs_repo.remove(file.as_os_str())?;
-                files_removed.insert(file.clone());
-            }
-        }
-        files.retain(|file, _| !files_removed.contains(file));
+        // Add files that have been added.
+        cvs_repo.add_multiple(
+            commit_state
+                .iter_new_non_binary_files()
+                .map(|file| file.cvs_relative_path()),
+            false,
+        )?;
+        cvs_repo.add_multiple(
+            commit_state
+                .iter_new_binary_files()
+                .map(|file| file.cvs_relative_path()),
+            true,
+        )?;
 
         // Actually commit.
         cvs_repo.commit(commit.message_raw_bytes())?;
@@ -188,4 +149,80 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn walk_tree_entry(
+    path: &str,
+    entry: &TreeEntry,
+    commit: &Commit,
+    state: &mut state::Global,
+    commit_state: &mut state::Commit,
+    repo: &Repository,
+) -> anyhow::Result<TreeWalkResult> {
+    let mut git_path = PathBuf::from(path);
+    if let Some(name) = entry.name() {
+        git_path.push(name);
+    }
+    let file = state.file(git_path);
+    let absolute = file.absolute_path();
+
+    match entry.kind() {
+        Some(ObjectType::Blob) => {
+            let oid = entry.id();
+            let blob = repo.blob(&oid)?;
+
+            // Figure out if we need to write this: does the blob OID match the
+            // previously written OID for this file?
+            let maybe_oid = state.get_oid(&file);
+            match maybe_oid {
+                Some(last_oid) if &oid == last_oid => {
+                    // It does match, so we don't need to do anything.
+                }
+                _ => {
+                    // We need to write the file, either because it doesn't
+                    // exist or has new content.
+                    fs::write(&absolute, blob.content())?;
+
+                    // CVS uses the modification time, so let's set
+                    // that.
+                    let time = FileTime::from_unix_time(commit.time().seconds(), 0);
+                    filetime::set_file_times(&absolute, time, time)?;
+
+                    // The file may be executable, so let's check.
+                    if (entry.filemode() & 0o111) != 0 {
+                        let perm = fs::metadata(&absolute)?.permissions().mode() | 0o111;
+
+                        fs::set_permissions(&absolute, Permissions::from_mode(perm))?;
+                    }
+
+                    // If it's a new file, we need to inform CVS.
+                    if maybe_oid.is_none() {
+                        commit_state.new_file(file.clone(), blob.is_binary());
+                    }
+
+                    // Finally, we'll store the OID that we just wrote to the
+                    // filesystem.
+                    state.save_oid(file.clone(), &oid);
+                }
+            };
+
+            commit_state.seen_file(file);
+            Ok(TreeWalkResult::Ok)
+        }
+        Some(ObjectType::Tree) => {
+            if fs::metadata(&absolute).is_err() {
+                fs::create_dir_all(absolute)?;
+
+                // We do need to add the directory to the new file tracking for
+                // this commit, because it has to be included in "cvs add".
+                commit_state.new_file(file, false);
+            }
+
+            Ok(TreeWalkResult::Ok)
+        }
+        _ => {
+            log::trace!("unknown kind: {:?}", entry.kind());
+            Ok(TreeWalkResult::Skip)
+        }
+    }
 }

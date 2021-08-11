@@ -1,10 +1,12 @@
 use std::{
+    convert::TryFrom,
     ffi::{OsStr, OsString},
     io::Write,
     path::{Path, PathBuf},
 };
 
 use subprocess::Exec;
+use sysconf::SysconfVariable;
 use tempfile::NamedTempFile;
 
 trait ExecExt {
@@ -74,6 +76,35 @@ impl Repository {
         Ok(())
     }
 
+    pub fn add_multiple<I, OS>(&self, paths: I, binary: bool) -> anyhow::Result<()>
+    where
+        I: Iterator<Item = OS>,
+        OS: AsRef<OsStr>,
+    {
+        let mut chunker =
+            ArgChunker::new(|chunk| self.do_add_multiple(chunk, binary), *ARG_MAX - 12);
+
+        for path in paths {
+            chunker.push(path)?;
+        }
+
+        Ok(())
+    }
+
+    fn do_add_multiple(&self, paths: &Vec<OsString>, binary: bool) -> anyhow::Result<()> {
+        let mut exec = self.cmd().arg("add");
+        if binary {
+            exec = exec.arg("-kb");
+        }
+
+        for path in paths {
+            exec = exec.arg(path);
+        }
+
+        exec.log().join()?;
+        Ok(())
+    }
+
     pub fn commit(&self, message: &[u8]) -> anyhow::Result<()> {
         let mut msgfile = NamedTempFile::new()?;
         msgfile.write_all(message)?;
@@ -95,8 +126,81 @@ impl Repository {
         Ok(())
     }
 
+    pub fn remove_multiple<I, OS>(&self, paths: I) -> anyhow::Result<()>
+    where
+        I: Iterator<Item = OS>,
+        OS: AsRef<OsStr>,
+    {
+        let mut chunker = ArgChunker::new(|chunk| self.do_remove_multiple(chunk), *ARG_MAX - 12);
+
+        for path in paths {
+            chunker.push(path)?;
+        }
+
+        Ok(())
+    }
+
+    fn do_remove_multiple(&self, paths: &Vec<OsString>) -> anyhow::Result<()> {
+        let mut exec = self.cmd().arg("remove");
+
+        for path in paths {
+            exec = exec.arg(path);
+        }
+
+        exec.log().join()?;
+        Ok(())
+    }
+
     fn cmd(&self) -> Exec {
         Exec::cmd(&self.cvs).cwd(&self.cwd)
+    }
+}
+
+struct ArgChunker<F: Fn(&Vec<OsString>) -> anyhow::Result<()>> {
+    acc: Vec<OsString>,
+    commit: F,
+    limit: usize,
+    size: usize,
+}
+
+impl<F: Fn(&Vec<OsString>) -> anyhow::Result<()>> ArgChunker<F> {
+    fn new(commit: F, limit: usize) -> Self {
+        Self {
+            acc: Vec::new(),
+            commit,
+            limit,
+            size: 0,
+        }
+    }
+
+    fn do_commit(&mut self) -> anyhow::Result<()> {
+        (self.commit)(&self.acc)?;
+
+        self.size = 0;
+        self.acc.clear();
+
+        Ok(())
+    }
+
+    fn push<OS: AsRef<OsStr>>(&mut self, path: OS) -> anyhow::Result<()> {
+        let owned = OsString::from(path.as_ref());
+
+        if self.size + owned.len() > self.limit {
+            self.do_commit()?;
+        }
+
+        self.size += owned.len();
+        self.acc.push(owned);
+
+        Ok(())
+    }
+}
+
+impl<F: Fn(&Vec<OsString>) -> anyhow::Result<()>> Drop for ArgChunker<F> {
+    fn drop(&mut self) {
+        if self.acc.len() > 0 {
+            self.do_commit().unwrap();
+        }
     }
 }
 
@@ -112,6 +216,11 @@ pub fn sanitise_branch(name: &str) -> String {
     }
 
     out
+}
+
+lazy_static! {
+    static ref ARG_MAX: usize =
+        usize::try_from(sysconf::raw::sysconf(SysconfVariable::ScArgMax).unwrap()).unwrap();
 }
 
 #[cfg(test)]
