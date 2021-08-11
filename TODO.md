@@ -1,0 +1,7 @@
+- Refactor the giant blob of crap that is the primary processing function.
+    - This probably includes moving the ad hoc HashMaps and HashSets into a proper state structure.
+- Figure out why timestamps aren't being persisted.
+- Implement executable bit support.
+- Handle adding branches to existing repositories.
+- Handle updating existing repostories with new commits.
+- Is there any way to speed this up? (Probably not, short of implementing a CVS client or exporting directly to a CVSROOT.)
