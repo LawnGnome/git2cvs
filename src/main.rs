@@ -125,7 +125,12 @@ fn main() -> anyhow::Result<()> {
             state
                 .remove_files_unseen_in_commit(&commit_state)
                 .into_iter()
-                .map(|file| file.cvs_relative_path()),
+                .map(|file| {
+                    // Everyone loves a good hidden side effect, right?
+                    fs::remove_file(file.absolute_path()).unwrap();
+
+                    file.cvs_relative_path()
+                }),
         )?;
 
         // Add files that have been added.
