@@ -9,11 +9,15 @@ mundane) shared library dependencies. Assuming you have the required libraries,
 then you can build a release build with `cargo build --release`, which will give
 you a binary in `target/release/git2cvs`.
 
-### Requirements
+### Build requirements
 
 - Rust 1.53+ (it may work on older versions; I haven't checked)
 - libgit2
 - libsqlite3
+
+### Runtime requirements
+
+- CVS
 
 ## Usage
 
