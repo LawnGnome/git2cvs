@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
-    fs,
+    fs::{self, Permissions},
+    os::unix::prelude::PermissionsExt,
     path::PathBuf,
 };
 
@@ -125,6 +126,16 @@ fn main() -> anyhow::Result<()> {
                                 // that.
                                 let time = FileTime::from_unix_time(commit.time().seconds(), 0);
                                 filetime::set_file_times(&absolute, time, time).unwrap();
+
+                                // The file may be executable, so let's check.
+                                if (entry.filemode() & 0o111) != 0 {
+                                    let perm =
+                                        fs::metadata(&absolute).unwrap().permissions().mode()
+                                            | 0o111;
+
+                                    fs::set_permissions(&absolute, Permissions::from_mode(perm))
+                                        .unwrap();
+                                }
 
                                 cvs_repo
                                     .add(cvs_path.as_os_str(), blob.is_binary())
